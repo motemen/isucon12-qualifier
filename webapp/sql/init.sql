@@ -41,4 +41,4 @@ CREATE TABLE IF NOT EXISTS player_score (
   updated_at BIGINT NOT NULL
 );
 
-DELETE FROM player_score WHERE created_at > 1654041599;
+-- DELETE FROM player_score WHERE created_at > 1654041599;
