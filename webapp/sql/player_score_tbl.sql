@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS player_score;
+
+CREATE TABLE IF NOT EXISTS player_score (
+  id VARCHAR(10) CHARACTER SET ascii NOT NULL PRIMARY KEY,
+  tenant_id BIGINT NOT NULL,
+  player_id VARCHAR(10) CHARACTER SET ascii NOT NULL,
+  competition_id VARCHAR(10) CHARACTER SET ascii NOT NULL,
+  score BIGINT NOT NULL,
+  row_num BIGINT NOT NULL,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
