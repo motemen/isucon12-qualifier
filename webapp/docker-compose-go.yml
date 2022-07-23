@@ -7,7 +7,6 @@ services:
       ISUCON_DB_USER: isucon
       ISUCON_DB_PASSWORD: isucon
       ISUCON_DB_NAME: isuports
-      ISUCON_SQLITE_TRACE_FILE: /home/isucon/tmp/sqlite-trace.log
     network_mode: host
     volumes:
       - /home/isucon/webapp/tenant_db:/home/isucon/webapp/tenant_db
