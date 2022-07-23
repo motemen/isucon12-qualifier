@@ -1053,6 +1053,12 @@ type ScoreHandlerResult struct {
 	Rows int64 `json:"rows"`
 }
 
+type rankRowType struct {
+	PlayerID string
+	Score    int64
+	RowNum   int
+}
+
 // テナント管理者向けAPI
 // POST /api/organizer/competition/:competition_id/score
 // 大会のスコアをCSVでアップロードする
@@ -1192,6 +1198,40 @@ func competitionScoreHandler(c echo.Context) error {
 		if _, err := redisConn.Do("SET", redisKeyPlayerScore(ps.CompetitionID, ps.PlayerID), ps.Score); err != nil {
 			return err
 		}
+	}
+
+	playerSeen := map[string]bool{}
+	rankRows := []rankRowType{}
+	for i := len(playerScoreRows) - 1; i >= 0; i-- {
+		playerScoreRow := playerScoreRows[i]
+		if playerSeen[playerScoreRow.PlayerID] {
+			continue
+		}
+		playerSeen[playerScoreRow.PlayerID] = true
+
+		rankRow := rankRowType{
+			PlayerID: playerScoreRow.PlayerID,
+			Score:    playerScoreRow.Score,
+			RowNum:   i,
+		}
+		rankRows = append(rankRows, rankRow)
+	}
+
+	sort.Slice(rankRows, func(i, j int) bool {
+		if rankRows[i].Score == rankRows[j].Score {
+			return rankRows[i].RowNum < rankRows[j].RowNum
+		}
+		return rankRows[i].Score > rankRows[j].Score
+	})
+
+	b, err := json.Marshal(rankRows)
+	if err != nil {
+		return fmt.Errorf("error json.Marshal: %w", err)
+	}
+
+	_, err = redisConn.Do("SET", "rankRows:"+competitionID, b)
+	if err != nil {
+		return fmt.Errorf("error redis SET rankRows:%s %w", competitionID, err)
 	}
 
 	return c.JSON(http.StatusOK, SuccessResult{
@@ -1459,71 +1499,99 @@ func competitionRankingHandler(c echo.Context) error {
 		}
 	}
 
-	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-	fl, err := flockByTenantID(v.tenantID)
-	if err != nil {
-		return fmt.Errorf("error flockByTenantID: %w", err)
-	}
-	defer fl.Close()
-	pss := []PlayerScoreRow{}
-	if err := tenantDB.SelectContext(
-		ctx,
-		&pss,
-		"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
-		tenant.ID,
-		competitionID,
-	); err != nil {
-		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
-	}
+	ranks := []CompetitionRank{}
 
-	playerIDsMap := map[string]bool{}
-	for _, ps := range pss {
-		playerIDsMap[ps.PlayerID] = true
-	}
-	uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
-	for playerID := range playerIDsMap {
-		uniquePlayerIDs = append(uniquePlayerIDs, playerID)
-	}
-
-	sql := "SELECT * FROM player WHERE id IN (?)"
-	sql, params, err := sqlx.In(sql, uniquePlayerIDs)
-	if err != nil {
-		return fmt.Errorf("sqlx.In: %e", err)
-	}
-
-	var players []PlayerRow
-	err = tenantDB.SelectContext(ctx, &players, sql, params...)
-	if err != nil {
-		return fmt.Errorf("%q: %e", sql, err)
-	}
-	idToPlayerRow := map[string]PlayerRow{}
-	for _, p := range players {
-		idToPlayerRow[p.ID] = p
-	}
-
-	ranks := make([]CompetitionRank, 0, len(pss))
-	scoredPlayerSet := make(map[string]struct{}, len(pss))
-	for _, ps := range pss {
-		// player_scoreが同一player_id内ではrow_numの降順でソートされているので
-		// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
-		if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
-			continue
+	b, err := redis.Bytes(redisConn.Do("GET", "rankRows:"+competitionID))
+	if err == nil {
+		var rankRows []rankRowType
+		err = json.Unmarshal(b, &rankRows)
+		if err != nil {
+			return fmt.Errorf("error json.Unmarshal: %w", err)
 		}
-		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p := idToPlayerRow[ps.PlayerID]
-		ranks = append(ranks, CompetitionRank{
-			Score:             ps.Score,
-			PlayerID:          p.ID,
-			PlayerDisplayName: p.DisplayName,
-			RowNum:            ps.RowNum,
+
+		ranks = make([]CompetitionRank, len(rankRows))
+		for i := range ranks {
+			player, err := retrievePlayer(ctx, tenantDB, ranks[i].PlayerID)
+			if err != nil {
+				return fmt.Errorf("error retrievePlayer: %w", err)
+			}
+			ranks[i] = CompetitionRank{
+				Rank:              int64(i),
+				Score:             ranks[i].Score,
+				PlayerDisplayName: player.DisplayName,
+				PlayerID:          player.ID,
+			}
+		}
+	} else if err != redis.ErrNil {
+		return fmt.Errorf("error redis GET rankRows:%s, %w", competitionID, err)
+	} else {
+		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+		fl, err := flockByTenantID(v.tenantID)
+		if err != nil {
+			return fmt.Errorf("error flockByTenantID: %w", err)
+		}
+		defer fl.Close()
+		pss := []PlayerScoreRow{}
+		if err := tenantDB.SelectContext(
+			ctx,
+			&pss,
+			"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
+			tenant.ID,
+			competitionID,
+		); err != nil {
+			return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
+		}
+
+		playerIDsMap := map[string]bool{}
+		for _, ps := range pss {
+			playerIDsMap[ps.PlayerID] = true
+		}
+		uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
+		for playerID := range playerIDsMap {
+			uniquePlayerIDs = append(uniquePlayerIDs, playerID)
+		}
+
+		sql := "SELECT * FROM player WHERE id IN (?)"
+		sql, params, err := sqlx.In(sql, uniquePlayerIDs)
+		if err != nil {
+			return fmt.Errorf("sqlx.In: %e", err)
+		}
+
+		var players []PlayerRow
+		err = tenantDB.SelectContext(ctx, &players, sql, params...)
+		if err != nil {
+			return fmt.Errorf("%q: %e", sql, err)
+		}
+		idToPlayerRow := map[string]PlayerRow{}
+		for _, p := range players {
+			idToPlayerRow[p.ID] = p
+		}
+
+		scoredPlayerSet := make(map[string]struct{}, len(pss))
+		for _, ps := range pss {
+			// player_scoreが同一player_id内ではrow_numの降順でソートされているので
+			// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+			if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
+				continue
+			}
+			scoredPlayerSet[ps.PlayerID] = struct{}{}
+			p := idToPlayerRow[ps.PlayerID]
+			ranks = append(ranks, CompetitionRank{
+				Score:             ps.Score,
+				PlayerID:          p.ID,
+				PlayerDisplayName: p.DisplayName,
+				RowNum:            ps.RowNum,
+			})
+		}
+		sort.Slice(ranks, func(i, j int) bool {
+			if ranks[i].Score == ranks[j].Score {
+				return ranks[i].RowNum < ranks[j].RowNum
+			}
+			return ranks[i].Score > ranks[j].Score
 		})
+
 	}
-	sort.Slice(ranks, func(i, j int) bool {
-		if ranks[i].Score == ranks[j].Score {
-			return ranks[i].RowNum < ranks[j].RowNum
-		}
-		return ranks[i].Score > ranks[j].Score
-	})
+
 	pagedRanks := make([]CompetitionRank, 0, 100)
 	for i, rank := range ranks {
 		if int64(i) < rankAfter {
