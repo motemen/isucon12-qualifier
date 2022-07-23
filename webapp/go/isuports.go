@@ -1437,6 +1437,32 @@ func competitionRankingHandler(c echo.Context) error {
 	); err != nil {
 		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
 	}
+
+	playerIDsMap := map[string]bool{}
+	for _, ps := range pss {
+		playerIDsMap[ps.PlayerID] = true
+	}
+	uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
+	for playerID := range playerIDsMap {
+		uniquePlayerIDs = append(uniquePlayerIDs, playerID)
+	}
+
+	sql := "SELECT * FROM player WHERE id IN (?)"
+	sql, params, err := sqlx.In(sql, uniquePlayerIDs)
+	if err != nil {
+		return fmt.Errorf("sqlx.In: %e", err)
+	}
+
+	var players []PlayerRow
+	err = tenantDB.SelectContext(ctx, &players, sql, params...)
+	if err != nil {
+		return fmt.Errorf("%q: %e", sql, err)
+	}
+	idToPlayerRow := map[string]PlayerRow{}
+	for _, p := range players {
+		idToPlayerRow[p.ID] = p
+	}
+
 	ranks := make([]CompetitionRank, 0, len(pss))
 	scoredPlayerSet := make(map[string]struct{}, len(pss))
 	for _, ps := range pss {
@@ -1446,10 +1472,7 @@ func competitionRankingHandler(c echo.Context) error {
 			continue
 		}
 		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
-		if err != nil {
-			return fmt.Errorf("error retrievePlayer: %w", err)
-		}
+		p := idToPlayerRow[ps.PlayerID]
 		ranks = append(ranks, CompetitionRank{
 			Score:             ps.Score,
 			PlayerID:          p.ID,
