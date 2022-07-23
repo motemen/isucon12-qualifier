@@ -577,13 +577,16 @@ func validateTenantName(name string) error {
 }
 
 type BillingReport struct {
-	CompetitionID     string `json:"competition_id"`
-	CompetitionTitle  string `json:"competition_title"`
-	PlayerCount       int64  `json:"player_count"`        // スコアを登録した参加者数
-	VisitorCount      int64  `json:"visitor_count"`       // ランキングを閲覧だけした(スコアを登録していない)参加者数
-	BillingPlayerYen  int64  `json:"billing_player_yen"`  // 請求金額 スコアを登録した参加者分
-	BillingVisitorYen int64  `json:"billing_visitor_yen"` // 請求金額 ランキングを閲覧だけした(スコアを登録していない)参加者分
-	BillingYen        int64  `json:"billing_yen"`         // 合計請求金額
+	ID                int64  `db:"id"`
+	TenantID          int64  `db:"tenant_id"`
+	CompetitionID     string `db:"competition_id"`
+	CompetitionTitle  string `db:"competition_title"`
+	PlayerCount       int64  `db:"player_count"`        // スコアを登録した参加者数
+	VisitorCount      int64  `db:"visitor_count"`       // ランキングを閲覧だけした(スコアを登録していない)参加者数
+	BillingPlayerYen  int64  `db:"billing_player_yen"`  // 請求金額 スコアを登録した参加者分
+	BillingVisitorYen int64  `db:"billing_visitor_yen"` // 請求金額 ランキングを閲覧だけした(スコアを登録していない)参加者分
+	BillingYen        int64  `db:"billing_yen"`         // 合計請求金額
+	UpdatedAt         int64  `db:"updated_at"`
 }
 
 type VisitHistoryRow struct {
@@ -751,7 +754,7 @@ func getBillingReportByCompetition(ctx context.Context, tenantID int64, competit
 	if err := adminDB.SelectContext(
 		ctx,
 		&br,
-		"SELECT * FROM billing WHERE tenant_id=? AND competitionID IN (?)",
+		"SELECT * FROM billing WHERE tenant_id=? AND competition_id IN (?)",
 		tenantID, strings.Join(competitonIDs, ","),
 	); err != nil {
 		return nil, fmt.Errorf("error Select billing: %w", err)
@@ -1152,12 +1155,12 @@ func competitionFinishHandler(c echo.Context) error {
 	}
 	if _, err := adminDB.ExecContext(
 		ctx,
-		"INSERT INTO billing (tenant_id, competition_id, player_count, visitor_count, billing_player_yen, billing_visitor_yen, billing_yen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		v.tenantID, bills.CompetitionID, bills.PlayerCount, bills.VisitorCount, bills.BillingPlayerYen, bills.BillingVisitorYen, bills.BillingYen, now,
+		"INSERT INTO billing (tenant_id, competition_id, competition_title, player_count, visitor_count, billing_player_yen, billing_visitor_yen, billing_yen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		v.tenantID, bills.CompetitionID, bills.CompetitionTitle, bills.PlayerCount, bills.VisitorCount, bills.BillingPlayerYen, bills.BillingVisitorYen, bills.BillingYen, now,
 	); err != nil {
 		return fmt.Errorf(
-			"error Insert competition: tenant_id=%d, competition_id=%s, player_count=%d, visitor_count=%d, billing_player_yen=%d, billing_visitor_yen=%d, billing_yen=%d, updatedAt=%d, %w",
-			v.tenantID, bills.CompetitionID, bills.PlayerCount, bills.VisitorCount, bills.BillingPlayerYen, bills.BillingVisitorYen, bills.BillingYen, now, err,
+			"error Insert competition: tenant_id=%d, competition_id=%s, competition_title=%s, player_count=%d, visitor_count=%d, billing_player_yen=%d, billing_visitor_yen=%d, billing_yen=%d, updatedAt=%d, %w",
+			v.tenantID, bills.CompetitionID, bills.CompetitionTitle, bills.PlayerCount, bills.VisitorCount, bills.BillingPlayerYen, bills.BillingVisitorYen, bills.BillingYen, now, err,
 		)
 	}
 
@@ -1340,13 +1343,17 @@ func billingHandler(c echo.Context) error {
 	); err != nil {
 		return fmt.Errorf("error Select competition: %w", err)
 	}
-	tbrs := make([]BillingReport, 0, len(cs))
+	compIDs := make([]string, 0, len(cs))
 	for _, comp := range cs {
-		report, err := billingReportByCompetition(ctx, tenantDB, v.tenantID, comp.ID)
-		if err != nil {
-			return fmt.Errorf("error billingReportByCompetition: %w", err)
-		}
-		tbrs = append(tbrs, *report)
+		compIDs = append(compIDs, comp.ID)
+	}
+	tbrs := make([]BillingReport, 0, len(cs))
+	reports, err := getBillingReportByCompetition(ctx, v.tenantID, compIDs)
+	if err != nil {
+		return fmt.Errorf("failed to getBillingReportByCompetition: %w", err)
+	}
+	for _, report := range *reports {
+		tbrs = append(tbrs, report)
 	}
 
 	res := SuccessResult{
