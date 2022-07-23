@@ -88,6 +88,18 @@ restart-db:
 	ssh isu03 "sudo systemctl restart mysql.service" & \
 	wait
 
+## redis
+
+deploy-redis: scp-redis restart-redis
+
+scp-redis:
+	ssh isu02 "sudo dd of=/etc/redis/redis.conf" < ./etc/redis/redis.conf
+
+restart-redis:
+	ssh isu02 "sudo systemctl restart redis-server.service"
+
+## 計測
+
 pt-query-digest: always
 	ssh isu01 'sudo cat /var/log/mysql/mysql-slow.log | pt-query-digest'
 
