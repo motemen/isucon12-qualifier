@@ -148,7 +148,7 @@ var initialVisitHistoryJSON []byte
 
 func initializeRedis(ctx context.Context) error {
 	type vhRow struct {
-		PlayerID       string
+		PlayedID       string
 		FirstVisitedAt int64
 		CompetitionID  string
 	}
@@ -178,7 +178,7 @@ func initializeRedis(ctx context.Context) error {
 	}
 
 	for _, vh := range vhs {
-		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayerID, vh.FirstVisitedAt)
+		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayedID, vh.FirstVisitedAt)
 		if err != nil {
 			return err
 		}
@@ -613,9 +613,9 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 	defer redisConn.Close()
 
 	// PlayedID - FirstVisitedAt で入ってるよ
-	kvs, err := redis.String(redisConn.Do("HGETALL", redisKeyVisitHistory(comp.ID)))
+	kvs, err := redis.Strings(redisConn.Do("HGETALL", redisKeyVisitHistory(comp.ID)))
 	if err != nil {
-		return nil, fmt.Errorf("redis HGETALL %v", redisKeyVisitHistory(comp.ID))
+		return nil, fmt.Errorf("redis HGETALL %v, %e", redisKeyVisitHistory(comp.ID), err)
 	}
 	for i := 0; i < len(kvs); i += 2 {
 		playerID, _ := redis.String(kvs[i], nil)
