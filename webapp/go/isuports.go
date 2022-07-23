@@ -1,9 +1,12 @@
 package isuports
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +30,8 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+
+	"github.com/gomodule/redigo/redis"
 )
 
 const (
@@ -131,11 +136,68 @@ func SetCacheControlPrivate(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+var redisPool *redis.Pool
+
+func redisKeyVisitHistory(competitionID string) string {
+	const redisKeyPrefixVisitHistory = "visitHistory:" // + competitionID
+	return redisKeyPrefixVisitHistory + competitionID
+}
+
+//go:embed initial_visit_history.json
+var initialVisitHistoryJSON []byte
+
+func initializeRedis(ctx context.Context) error {
+	type vhRow struct {
+		PlayedID       string
+		FirstVisitedAt int64
+		CompetitionID  string
+	}
+
+	vhs := []vhRow{}
+	err := json.NewDecoder(bytes.NewReader(initialVisitHistoryJSON)).Decode(&vhs)
+	if err != nil {
+		return fmt.Errorf("json.Decode: len=%v, %e", len(initialVisitHistoryJSON), err)
+	}
+
+	/*
+		if err := adminDB.SelectContext(
+			ctx,
+			&vhs,
+			"SELECT player_id, MIN(created_at) AS min_created_at, competition_id FROM visit_history GROUP BY player_id, competition_id",
+		); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("error Select visit_history: %e", err)
+		}
+	*/
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	_, err = redisConn.Do("FLUSHALL")
+	if err != nil {
+		return err
+	}
+
+	for _, vh := range vhs {
+		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayedID, vh.FirstVisitedAt)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Run は cmd/isuports/main.go から呼ばれるエントリーポイントです
 func Run() {
 	e := echo.New()
 	e.Debug = true
 	e.Logger.SetLevel(log.DEBUG)
+
+	redisPool = &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			return redis.DialURL("redis://isuports-2.t.isucon.dev:6379")
+		},
+	}
 
 	var (
 		sqlLogger io.Closer
@@ -545,23 +607,24 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 	}
 
 	// ランキングにアクセスした参加者のIDを取得する
-	vhs := []VisitHistorySummaryRow{}
-	if err := adminDB.SelectContext(
-		ctx,
-		&vhs,
-		"SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? AND competition_id = ? GROUP BY player_id",
-		tenantID,
-		comp.ID,
-	); err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("error Select visit_history: tenantID=%d, competitionID=%s, %w", tenantID, comp.ID, err)
-	}
 	billingMap := map[string]string{}
-	for _, vh := range vhs {
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	// PlayedID - FirstVisitedAt で入ってるよ
+	kvs, err := redis.Strings(redisConn.Do("HGETALL", redisKeyVisitHistory(comp.ID)))
+	if err != nil {
+		return nil, fmt.Errorf("redis HGETALL %v, %e", redisKeyVisitHistory(comp.ID), err)
+	}
+	for i := 0; i < len(kvs); i += 2 {
+		playerID, _ := redis.String(kvs[i], nil)
+		firstVisitedAt, _ := redis.Int64(kvs[i], nil)
 		// competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
-		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < vh.MinCreatedAt {
+		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < firstVisitedAt {
 			continue
 		}
-		billingMap[vh.PlayerID] = "visitor"
+		billingMap[playerID] = "visitor"
 	}
 
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
@@ -1116,7 +1179,6 @@ func competitionScoreHandler(c echo.Context) error {
 				"error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
 				ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
 			)
-
 		}
 	}
 
@@ -1340,14 +1402,14 @@ func competitionRankingHandler(c echo.Context) error {
 		return fmt.Errorf("error Select tenant: id=%d, %w", v.tenantID, err)
 	}
 
-	if _, err := adminDB.ExecContext(
-		ctx,
-		"INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-		v.playerID, tenant.ID, competitionID, now, now,
-	); err != nil {
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	_, err = redisConn.Do("HSETNX", redisKeyVisitHistory(competitionID), v.playerID, now)
+	if err != nil {
 		return fmt.Errorf(
-			"error Insert visit_history: playerID=%s, tenantID=%d, competitionID=%s, createdAt=%d, updatedAt=%d, %w",
-			v.playerID, tenant.ID, competitionID, now, now, err,
+			"failed: HSETNX %v %v %v",
+			redisKeyVisitHistory(competitionID), v.playerID, now,
 		)
 	}
 
@@ -1375,6 +1437,32 @@ func competitionRankingHandler(c echo.Context) error {
 	); err != nil {
 		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
 	}
+
+	playerIDsMap := map[string]bool{}
+	for _, ps := range pss {
+		playerIDsMap[ps.PlayerID] = true
+	}
+	uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
+	for playerID := range playerIDsMap {
+		uniquePlayerIDs = append(uniquePlayerIDs, playerID)
+	}
+
+	sql := "SELECT * FROM player WHERE id IN (?)"
+	sql, params, err := sqlx.In(sql, uniquePlayerIDs)
+	if err != nil {
+		return fmt.Errorf("sqlx.In: %e", err)
+	}
+
+	var players []PlayerRow
+	err = tenantDB.SelectContext(ctx, &players, sql, params...)
+	if err != nil {
+		return fmt.Errorf("%q: %e", sql, err)
+	}
+	idToPlayerRow := map[string]PlayerRow{}
+	for _, p := range players {
+		idToPlayerRow[p.ID] = p
+	}
+
 	ranks := make([]CompetitionRank, 0, len(pss))
 	scoredPlayerSet := make(map[string]struct{}, len(pss))
 	for _, ps := range pss {
@@ -1384,10 +1472,7 @@ func competitionRankingHandler(c echo.Context) error {
 			continue
 		}
 		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
-		if err != nil {
-			return fmt.Errorf("error retrievePlayer: %w", err)
-		}
+		p := idToPlayerRow[ps.PlayerID]
 		ranks = append(ranks, CompetitionRank{
 			Score:             ps.Score,
 			PlayerID:          p.ID,
@@ -1616,5 +1701,10 @@ func initializeHandler(c echo.Context) error {
 	res := InitializeHandlerResult{
 		Lang: "go",
 	}
+	err = initializeRedis(context.Background())
+	if err != nil {
+		return fmt.Errorf("initializeRedis: %e", err)
+	}
+
 	return c.JSON(http.StatusOK, SuccessResult{Status: true, Data: res})
 }
