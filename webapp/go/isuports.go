@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/gofrs/flock"
 	"github.com/gomodule/redigo/redis"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
@@ -122,6 +124,11 @@ var redisPool *redis.Pool
 func redisKeyVisitHistory(competitionID string) string {
 	const redisKeyPrefixVisitHistory = "visitHistory:" // + competitionID
 	return redisKeyPrefixVisitHistory + competitionID
+}
+
+func redisKeyPlayerScore(competitionID, playerID string) string {
+	const redisKeyPrefixVisitHistory = "playerScore:" // + competitionID + ":" + playerID
+	return redisKeyPrefixVisitHistory + competitionID + ":" + playerID
 }
 
 //go:embed initial_visit_history.json
@@ -452,6 +459,23 @@ type PlayerScoreRow struct {
 	UpdatedAt     int64  `db:"updated_at"`
 }
 
+// 排他ロックのためのファイル名を生成する
+func lockFilePath(id int64) string {
+	tenantDBDir := getEnv("ISUCON_TENANT_DB_DIR", "../tenant_db")
+	return filepath.Join(tenantDBDir, fmt.Sprintf("%d.lock", id))
+}
+
+// 排他ロックする
+func flockByTenantID(tenantID int64) (io.Closer, error) {
+	p := lockFilePath(tenantID)
+
+	fl := flock.New(p)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("error flock.Lock: path=%s, %w", p, err)
+	}
+	return fl, nil
+}
+
 type TenantsAddHandlerResult struct {
 	Tenant TenantWithBilling `json:"tenant"`
 }
@@ -573,19 +597,41 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 		billingMap[playerID] = "visitor"
 	}
 
-	// スコアを登録した参加者のIDを取得する
-	scoredPlayerIDs := []string{}
-	if err := tenantDB.SelectContext(
-		ctx,
-		&scoredPlayerIDs,
-		"SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = ? AND competition_id = ?",
-		tenantID, comp.ID,
-	); err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("error Select count player_score: tenantID=%d, competitionID=%s, %w", tenantID, competitonID, err)
-	}
-	for _, pid := range scoredPlayerIDs {
-		// スコアが登録されている参加者
-		billingMap[pid] = "player"
+	b, err := redis.Bytes(redisConn.Do("GET", "rankRows:"+comp.ID))
+	if err == nil {
+		var rankRows []rankRowType
+		err = json.Unmarshal(b, &rankRows)
+		if err != nil {
+			return nil, fmt.Errorf("error json.Unmarshal: %w", err)
+		}
+
+		for i := range rankRows {
+			billingMap[rankRows[i].PlayerID] = "player"
+		}
+	} else if err == redis.ErrNil {
+		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+		fl, err := flockByTenantID(tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("error flockByTenantID: %w", err)
+		}
+		defer fl.Close()
+
+		// スコアを登録した参加者のIDを取得する
+		scoredPlayerIDs := []string{}
+		if err := tenantDB.SelectContext(
+			ctx,
+			&scoredPlayerIDs,
+			"SELECT DISTINCT(player_id) FROM player_score WHERE tenant_id = ? AND competition_id = ?",
+			tenantID, comp.ID,
+		); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("error Select count player_score: tenantID=%d, competitionID=%s, %w", tenantID, competitonID, err)
+		}
+		for _, pid := range scoredPlayerIDs {
+			// スコアが登録されている参加者
+			billingMap[pid] = "player"
+		}
+	} else {
+		return nil, fmt.Errorf("error redis GET %v, %e", "rankRows:"+comp.ID, err)
 	}
 
 	// 大会が終了している場合のみ請求金額が確定するので計算する
@@ -981,6 +1027,12 @@ type ScoreHandlerResult struct {
 	Rows int64 `json:"rows"`
 }
 
+type rankRowType struct {
+	PlayerID string
+	Score    int64
+	RowNum   int
+}
+
 // テナント管理者向けAPI
 // POST /api/organizer/competition/:competition_id/score
 // 大会のスコアをCSVでアップロードする
@@ -1038,6 +1090,9 @@ func competitionScoreHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid CSV headers")
 	}
 
+	tx := tenantDB.MustBeginTx(ctx, nil)
+	defer tx.Rollback()
+
 	// / DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
 	var rowNum int64
 	playerScoreRows := []PlayerScoreRow{}
@@ -1054,7 +1109,7 @@ func competitionScoreHandler(c echo.Context) error {
 			return fmt.Errorf("row must have two columns: %#v", row)
 		}
 		playerID, scoreStr := row[0], row[1]
-		if _, err := retrievePlayer(ctx, tenantDB, playerID); err != nil {
+		if _, err := retrievePlayer(ctx, tx, playerID); err != nil {
 			// 存在しない参加者が含まれている
 			if errors.Is(err, sql.ErrNoRows) {
 				return echo.NewHTTPError(
@@ -1088,16 +1143,20 @@ func competitionScoreHandler(c echo.Context) error {
 		})
 	}
 
-	if _, err := tenantDB.ExecContext(
+	/*if _, err := tenantDB.ExecContext(
 		ctx,
 		"DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?",
 		v.tenantID,
 		competitionID,
 	); err != nil {
 		return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
-	}
+	}*/
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
 	for _, ps := range playerScoreRows {
-		if _, err := tenantDB.NamedExecContext(
+		// FIXME: SQLite 脱却できたらここの SQLite 書き込みは不要
+		/*if _, err := tenantDB.NamedExecContext(
 			ctx,
 			"INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (:id, :tenant_id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at)",
 			ps,
@@ -1106,7 +1165,51 @@ func competitionScoreHandler(c echo.Context) error {
 				"error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
 				ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
 			)
+		}*/
+		if _, err := redisConn.Do("SET", redisKeyPlayerScore(ps.CompetitionID, ps.PlayerID), ps.Score); err != nil {
+			return err
 		}
+	}
+
+	playerSeen := map[string]bool{}
+	rankRows := []rankRowType{}
+	for i := len(playerScoreRows) - 1; i >= 0; i-- {
+		playerScoreRow := playerScoreRows[i]
+		if playerSeen[playerScoreRow.PlayerID] {
+			continue
+		}
+		playerSeen[playerScoreRow.PlayerID] = true
+
+		rankRow := rankRowType{
+			PlayerID: playerScoreRow.PlayerID,
+			Score:    playerScoreRow.Score,
+			RowNum:   i,
+		}
+		rankRows = append(rankRows, rankRow)
+	}
+
+	sort.Slice(rankRows, func(i, j int) bool {
+		if rankRows[i].Score == rankRows[j].Score {
+			return rankRows[i].RowNum < rankRows[j].RowNum
+		}
+		return rankRows[i].Score > rankRows[j].Score
+	})
+
+	b, err := json.Marshal(rankRows)
+	if err != nil {
+		return fmt.Errorf("error json.Marshal: %w", err)
+	}
+
+	_, err = redisConn.Do("SET", "rankRows:"+competitionID, b)
+	if err != nil {
+		return fmt.Errorf("error redis SET rankRows:%s %w", competitionID, err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf(
+			"error Commit: %w", err,
+		)
 	}
 
 	return c.JSON(http.StatusOK, SuccessResult{
@@ -1219,25 +1322,56 @@ func playerHandler(c echo.Context) error {
 	}
 
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+	fl, err := flockByTenantID(v.tenantID)
+	if err != nil {
+		return fmt.Errorf("error flockByTenantID: %w", err)
+	}
+	defer fl.Close()
+
 	pss := make([]PlayerScoreRow, 0, len(cs))
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+	// redis にない Competitions は SQLite から取れるようにリストに入れておく
+	cs_missing_in_redis := []CompetitionRow{}
 	for _, c := range cs {
-		ps := PlayerScoreRow{}
-		if err := tenantDB.GetContext(
-			ctx,
-			&ps,
-			// 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
-			"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1",
-			v.tenantID,
-			c.ID,
-			p.ID,
-		); err != nil {
-			// 行がない = スコアが記録されてない
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
+		score, err := redis.Int64(redisConn.Do("GET", redisKeyPlayerScore(c.ID, playerID)))
+		if err != nil {
+			if err == redis.ErrNil {
+				cs_missing_in_redis = append(cs_missing_in_redis, c)
+			} else {
+				return fmt.Errorf("redis GET %v, %e", redisKeyPlayerScore(c.ID, playerID), err)
 			}
-			return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, playerID=%s, %w", v.tenantID, c.ID, p.ID, err)
+		}
+		ps := PlayerScoreRow{
+			TenantID:      v.tenantID,
+			PlayerID:      playerID,
+			CompetitionID: c.ID,
+			Score:         score,
 		}
 		pss = append(pss, ps)
+	}
+
+	// redis にない場合は SQLite から取る
+	if len(cs_missing_in_redis) > 0 {
+		for _, c := range cs_missing_in_redis {
+			ps := PlayerScoreRow{}
+			if err := tenantDB.GetContext(
+				ctx,
+				&ps,
+				// 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+				"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1",
+				v.tenantID,
+				c.ID,
+				p.ID,
+			); err != nil {
+				// 行がない = スコアが記録されてない
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, playerID=%s, %w", v.tenantID, c.ID, p.ID, err)
+			}
+			pss = append(pss, ps)
+		}
 	}
 
 	psds := make([]PlayerScoreDetail, 0, len(pss))
@@ -1340,66 +1474,100 @@ func competitionRankingHandler(c echo.Context) error {
 		}
 	}
 
+	ranks := []CompetitionRank{}
+
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-	pss := []PlayerScoreRow{}
-	if err := tenantDB.SelectContext(
-		ctx,
-		&pss,
-		"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
-		tenant.ID,
-		competitionID,
-	); err != nil {
-		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
-	}
-
-	playerIDsMap := map[string]bool{}
-	for _, ps := range pss {
-		playerIDsMap[ps.PlayerID] = true
-	}
-	uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
-	for playerID := range playerIDsMap {
-		uniquePlayerIDs = append(uniquePlayerIDs, playerID)
-	}
-
-	sql := "SELECT * FROM player WHERE id IN (?)"
-	sql, params, err := sqlx.In(sql, uniquePlayerIDs)
+	fl, err := flockByTenantID(v.tenantID)
 	if err != nil {
-		return fmt.Errorf("sqlx.In: %e", err)
+		return fmt.Errorf("error flockByTenantID: %w", err)
 	}
+	defer fl.Close()
 
-	var players []PlayerRow
-	err = tenantDB.SelectContext(ctx, &players, sql, params...)
-	if err != nil {
-		return fmt.Errorf("%q: %e", sql, err)
-	}
-	idToPlayerRow := map[string]PlayerRow{}
-	for _, p := range players {
-		idToPlayerRow[p.ID] = p
-	}
-
-	ranks := make([]CompetitionRank, 0, len(pss))
-	scoredPlayerSet := make(map[string]struct{}, len(pss))
-	for _, ps := range pss {
-		// player_scoreが同一player_id内ではrow_numの降順でソートされているので
-		// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
-		if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
-			continue
+	b, err := redis.Bytes(redisConn.Do("GET", "rankRows:"+competitionID))
+	if err == nil {
+		var rankRows []rankRowType
+		err = json.Unmarshal(b, &rankRows)
+		if err != nil {
+			return fmt.Errorf("error json.Unmarshal: %w", err)
 		}
-		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p := idToPlayerRow[ps.PlayerID]
-		ranks = append(ranks, CompetitionRank{
-			Score:             ps.Score,
-			PlayerID:          p.ID,
-			PlayerDisplayName: p.DisplayName,
-			RowNum:            ps.RowNum,
+
+		ranks = make([]CompetitionRank, len(rankRows))
+		for i := range rankRows {
+			player, err := retrievePlayer(ctx, tenantDB, rankRows[i].PlayerID)
+			if err != nil {
+				return fmt.Errorf("error retrievePlayer: %w", err)
+			}
+			ranks[i] = CompetitionRank{
+				Rank:              int64(i),
+				Score:             rankRows[i].Score,
+				PlayerDisplayName: player.DisplayName,
+				PlayerID:          player.ID,
+			}
+		}
+	} else if err != redis.ErrNil {
+		return fmt.Errorf("error redis GET rankRows:%s, %w", competitionID, err)
+	} else {
+		pss := []PlayerScoreRow{}
+		if err := tenantDB.SelectContext(
+			ctx,
+			&pss,
+			"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
+			tenant.ID,
+			competitionID,
+		); err != nil {
+			return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
+		}
+
+		playerIDsMap := map[string]bool{}
+		for _, ps := range pss {
+			playerIDsMap[ps.PlayerID] = true
+		}
+		uniquePlayerIDs := make([]string, 0, len(playerIDsMap))
+		for playerID := range playerIDsMap {
+			uniquePlayerIDs = append(uniquePlayerIDs, playerID)
+		}
+
+		sql := "SELECT * FROM player WHERE id IN (?)"
+		sql, params, err := sqlx.In(sql, uniquePlayerIDs)
+		if err != nil {
+			return fmt.Errorf("sqlx.In: %e", err)
+		}
+
+		var players []PlayerRow
+		err = tenantDB.SelectContext(ctx, &players, sql, params...)
+		if err != nil {
+			return fmt.Errorf("%q: %e", sql, err)
+		}
+		idToPlayerRow := map[string]PlayerRow{}
+		for _, p := range players {
+			idToPlayerRow[p.ID] = p
+		}
+
+		scoredPlayerSet := make(map[string]struct{}, len(pss))
+		for _, ps := range pss {
+			// player_scoreが同一player_id内ではrow_numの降順でソートされているので
+			// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+			if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
+				continue
+			}
+			scoredPlayerSet[ps.PlayerID] = struct{}{}
+			p := idToPlayerRow[ps.PlayerID]
+			ranks = append(ranks, CompetitionRank{
+				Score:             ps.Score,
+				PlayerID:          p.ID,
+				PlayerDisplayName: p.DisplayName,
+				RowNum:            ps.RowNum,
+			})
+		}
+		sort.Slice(ranks, func(i, j int) bool {
+			if ranks[i].Score == ranks[j].Score {
+				return ranks[i].RowNum < ranks[j].RowNum
+			}
+			return ranks[i].Score > ranks[j].Score
 		})
+
 	}
-	sort.Slice(ranks, func(i, j int) bool {
-		if ranks[i].Score == ranks[j].Score {
-			return ranks[i].RowNum < ranks[j].RowNum
-		}
-		return ranks[i].Score > ranks[j].Score
-	})
+
 	pagedRanks := make([]CompetitionRank, 0, 100)
 	for i, rank := range ranks {
 		if int64(i) < rankAfter {
