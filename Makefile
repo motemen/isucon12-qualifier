@@ -97,4 +97,4 @@ alp: always
 rsync-dumpsql:
 	rsync -avz initial_data/initial_data_mysql/ isu01:initial_data_mysql/
 	rsync -avz initial_data/initial_data_mysql/ isu02:initial_data_mysql/
-	rsync -avz initial_data/initial_data_mysql/ isu02:initial_data_mysql/
+	rsync -avz initial_data/initial_data_mysql/ isu03:initial_data_mysql/
