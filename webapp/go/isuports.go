@@ -1,9 +1,12 @@
 package isuports
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -140,32 +143,42 @@ func redisKeyVisitHistory(competitionID string) string {
 	return redisKeyPrefixVisitHistory + competitionID
 }
 
+//go:embed initial_visit_history.json
+var initialVisitHistoryJSON []byte
+
 func initializeRedis(ctx context.Context) error {
 	type vhRow struct {
-		PlayerID      string `db:"player_id"`
-		MinCreatedAt  int64  `db:"min_created_at"`
-		CompetitionID string `db:"competition_id"`
+		PlayerID       string
+		FirstVisitedAt int64
+		CompetitionID  string
 	}
 
 	vhs := []vhRow{}
-	if err := adminDB.SelectContext(
-		ctx,
-		&vhs,
-		"SELECT player_id, MIN(created_at) AS min_created_at, competition_id FROM visit_history GROUP BY player_id",
-	); err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("error Select visit_history")
+	err := json.NewDecoder(bytes.NewReader(initialVisitHistoryJSON)).Decode(&vhs)
+	if err != nil {
+		return fmt.Errorf("json.Decode: len=%v, %e", len(initialVisitHistoryJSON), err)
 	}
+
+	/*
+		if err := adminDB.SelectContext(
+			ctx,
+			&vhs,
+			"SELECT player_id, MIN(created_at) AS min_created_at, competition_id FROM visit_history GROUP BY player_id, competition_id",
+		); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("error Select visit_history: %e", err)
+		}
+	*/
 
 	redisConn := redisPool.Get()
 	defer redisConn.Close()
 
-	_, err := redisConn.Do("FLUSHALL")
+	_, err = redisConn.Do("FLUSHALL")
 	if err != nil {
 		return err
 	}
 
 	for _, vh := range vhs {
-		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayerID, vh.MinCreatedAt)
+		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayerID, vh.FirstVisitedAt)
 		if err != nil {
 			return err
 		}
@@ -182,7 +195,7 @@ func Run() {
 
 	redisPool = &redis.Pool{
 		Dial: func() (redis.Conn, error) {
-			return redis.DialURL("isuports-2.t.isucon.dev")
+			return redis.DialURL("redis://isuports-2.t.isucon.dev:6379")
 		},
 	}
 
