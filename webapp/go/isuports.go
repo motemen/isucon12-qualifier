@@ -1090,6 +1090,9 @@ func competitionScoreHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid CSV headers")
 	}
 
+	tx := tenantDB.MustBeginTx(ctx, nil)
+	defer tx.Rollback()
+
 	// / DELETEしたタイミングで参照が来ると空っぽのランキングになるのでロックする
 	var rowNum int64
 	playerScoreRows := []PlayerScoreRow{}
@@ -1106,7 +1109,7 @@ func competitionScoreHandler(c echo.Context) error {
 			return fmt.Errorf("row must have two columns: %#v", row)
 		}
 		playerID, scoreStr := row[0], row[1]
-		if _, err := retrievePlayer(ctx, tenantDB, playerID); err != nil {
+		if _, err := retrievePlayer(ctx, tx, playerID); err != nil {
 			// 存在しない参加者が含まれている
 			if errors.Is(err, sql.ErrNoRows) {
 				return echo.NewHTTPError(
@@ -1200,6 +1203,13 @@ func competitionScoreHandler(c echo.Context) error {
 	_, err = redisConn.Do("SET", "rankRows:"+competitionID, b)
 	if err != nil {
 		return fmt.Errorf("error redis SET rankRows:%s %w", competitionID, err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf(
+			"error Commit: %w", err,
+		)
 	}
 
 	return c.JSON(http.StatusOK, SuccessResult{
@@ -1312,6 +1322,12 @@ func playerHandler(c echo.Context) error {
 	}
 
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+	fl, err := flockByTenantID(v.tenantID)
+	if err != nil {
+		return fmt.Errorf("error flockByTenantID: %w", err)
+	}
+	defer fl.Close()
+
 	pss := make([]PlayerScoreRow, 0, len(cs))
 	redisConn := redisPool.Get()
 	defer redisConn.Close()
@@ -1337,13 +1353,6 @@ func playerHandler(c echo.Context) error {
 
 	// redis にない場合は SQLite から取る
 	if len(cs_missing_in_redis) > 0 {
-		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-		fl, err := flockByTenantID(v.tenantID)
-		if err != nil {
-			return fmt.Errorf("error flockByTenantID: %w", err)
-		}
-		defer fl.Close()
-
 		for _, c := range cs_missing_in_redis {
 			ps := PlayerScoreRow{}
 			if err := tenantDB.GetContext(
