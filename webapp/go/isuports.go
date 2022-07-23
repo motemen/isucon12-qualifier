@@ -226,6 +226,9 @@ func Run() {
 	e.POST("/api/admin/tenants/add", tenantsAddHandler)
 	e.GET("/api/admin/tenants/billing", tenantsBillingHandler)
 
+	e.POST("/api/admin-internal/tenants/add", tenantsInternalAddHandler)
+	e.GET("/api/admin-internal/tenants/billing", tenantsInternalBillingHandler)
+
 	// テナント管理者向けAPI - 参加者追加、一覧、失格
 	e.GET("/api/organizer/players", playersListHandler)
 	e.POST("/api/organizer/players/add", playersAddHandler)
@@ -509,10 +512,62 @@ type TenantsAddHandlerResult struct {
 	Tenant TenantWithBilling `json:"tenant"`
 }
 
+func tenantNameToHost(name string) string {
+	ch := name[0]
+	switch {
+	case 'a' <= ch && ch <= 'm':
+		return "localhost"
+	default:
+		return "isuports-2.t.isucon.dev"
+	}
+}
+
 // SasS管理者用API
 // テナントを追加する
 // POST /api/admin/tenants/add
 func tenantsAddHandler(c echo.Context) error {
+	v, err := parseViewer(c)
+	if err != nil {
+		return fmt.Errorf("error parseViewer: %w", err)
+	}
+	if v.tenantName != "admin" {
+		// admin: SaaS管理者用の特別なテナント名
+		return echo.NewHTTPError(
+			http.StatusNotFound,
+			fmt.Sprintf("%s has not this API", v.tenantName),
+		)
+	}
+	if v.role != RoleAdmin {
+		return echo.NewHTTPError(http.StatusForbidden, "admin role required")
+	}
+
+	name := c.FormValue("name")
+	if err := validateTenantName(name); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+
+	host := tenantNameToHost(name)
+	form, _ := c.FormParams()
+
+	resp, err := http.Post(
+		fmt.Sprintf("http://%s:3000/api/admin-internal/tenants/add", host),
+		"application/x-www-form-urlencoded",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return err
+	}
+
+	var sr SuccessResult
+	err = json.NewDecoder(resp.Body).Decode(&sr)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, sr)
+}
+
+func tenantsInternalAddHandler(c echo.Context) error {
 	v, err := parseViewer(c)
 	if err != nil {
 		return fmt.Errorf("error parseViewer: %w", err)
@@ -534,6 +589,14 @@ func tenantsAddHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
+	host := tenantNameToHost(name)
+	form, _ := c.FormParams()
+
+	_, err = http.Post(
+		fmt.Sprintf("http://%s:3000/api/admin-internal/tenants/add", host),
+		"application/x-www-form-urlencoded",
+		strings.NewReader(form.Encode()),
+	)
 	ctx := context.Background()
 	now := time.Now().Unix()
 	insertRes, err := adminDB.ExecContext(
@@ -755,27 +818,19 @@ func tenantsBillingHandler(c echo.Context) error {
 				Name:        t.Name,
 				DisplayName: t.DisplayName,
 			}
-			tenantDB, err := connectToTenantDB(t.ID)
+			host := tenantNameToHost(t.Name)
+			resp, err := http.Get(
+				fmt.Sprintf("http://%s/api/admin-internal/tenants/billing?tenant_id=%s", host, t.ID),
+			)
 			if err != nil {
-				return fmt.Errorf("failed to connectToTenantDB: %w", err)
+				return err
 			}
-			defer tenantDB.Close()
-			cs := []CompetitionRow{}
-			if err := tenantDB.SelectContext(
-				ctx,
-				&cs,
-				"SELECT * FROM competition WHERE tenant_id=?",
-				t.ID,
-			); err != nil {
-				return fmt.Errorf("failed to Select competition: %w", err)
+			var yr billingYenResult
+			err = json.NewDecoder(resp.Body).Decode(&yr)
+			if err != nil {
+				return err
 			}
-			for _, comp := range cs {
-				report, err := billingReportByCompetition(ctx, tenantDB, t.ID, comp.ID)
-				if err != nil {
-					return fmt.Errorf("failed to billingReportByCompetition: %w", err)
-				}
-				tb.BillingYen += report.BillingYen
-			}
+			tb.BillingYen = yr.BillingYen
 			tenantBillings = append(tenantBillings, tb)
 			return nil
 		}(t)
@@ -792,6 +847,40 @@ func tenantsBillingHandler(c echo.Context) error {
 			Tenants: tenantBillings,
 		},
 	})
+}
+
+type billingYenResult struct {
+	BillingYen int64
+}
+
+func tenantsInternalBillingHandler(c echo.Context) error {
+	ctx := context.Background()
+	id, _ := strconv.ParseInt(c.FormValue("tenant_id"), 10, 64)
+	tenantDB, err := connectToTenantDB(id)
+	if err != nil {
+		return fmt.Errorf("failed to connectToTenantDB: %w", err)
+	}
+	defer tenantDB.Close()
+	cs := []CompetitionRow{}
+	if err := tenantDB.SelectContext(
+		ctx,
+		&cs,
+		"SELECT * FROM competition WHERE tenant_id=?",
+		id,
+	); err != nil {
+		return fmt.Errorf("failed to Select competition: %w", err)
+	}
+
+	var billingYen int64
+	for _, comp := range cs {
+		report, err := billingReportByCompetition(ctx, tenantDB, id, comp.ID)
+		if err != nil {
+			return fmt.Errorf("failed to billingReportByCompetition: %w", err)
+		}
+		billingYen += report.BillingYen
+	}
+
+	return c.JSON(http.StatusOK, billingYenResult{BillingYen: billingYen})
 }
 
 type PlayerDetail struct {
