@@ -10,12 +10,18 @@ $(APP): webapp/go/*.go always
 	cd webapp/go && go get && GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o ../../$(APP)
 
 # deploy: $(APP) stop reset-logs scp scp-sql scp-env start
-deploy: $(APP) stop reset-logs scp start
+deploy: $(APP) stop reset-logs scp scp-docker-compose start
 
 scp: $(APP)
 	scp ./$(APP) isu01:/home/isucon/webapp/go/$(APP) & \
 	scp ./$(APP) isu02:/home/isucon/webapp/go/$(APP) & \
 	scp ./$(APP) isu03:/home/isucon/webapp/go/$(APP) & \
+	wait
+
+scp-docker-compose:
+	scp ./webapp/docker-compose-go.yml isu01:/home/isucon/webapp/docker-compose-go.yml & \
+	scp ./webapp/docker-compose-go.yml isu02:/home/isucon/webapp/docker-compose-go.yml & \
+	scp ./webapp/docker-compose-go.yml isu03:/home/isucon/webapp/docker-compose-go.yml & \
 	wait
 
 scp-sql:
@@ -31,21 +37,21 @@ scp-env:
 	wait
 
 restart:
-	ssh isu01 "sudo systemctl restart $(APP).go.service" & \
-	ssh isu02 "sudo systemctl restart $(APP).go.service" & \
-	ssh isu03 "sudo systemctl restart $(APP).go.service" & \
+	ssh isu01 "sudo systemctl restart $(APP).service" & \
+	ssh isu02 "sudo systemctl restart $(APP).service" & \
+	ssh isu03 "sudo systemctl restart $(APP).service" & \
 	wait
 
 stop:
-	ssh isu01 "sudo systemctl stop $(APP).go.service" & \
-	ssh isu02 "sudo systemctl stop $(APP).go.service" & \
-	ssh isu03 "sudo systemctl stop $(APP).go.service" & \
+	ssh isu01 "sudo systemctl stop $(APP).service" & \
+	ssh isu02 "sudo systemctl stop $(APP).service" & \
+	ssh isu03 "sudo systemctl stop $(APP).service" & \
 	wait
 
 start:
-	ssh isu01 "sudo systemctl start $(APP).go.service" & \
-	ssh isu02 "sudo systemctl start $(APP).go.service" & \
-	ssh isu03 "sudo systemctl start $(APP).go.service" & \
+	ssh isu01 "sudo systemctl start $(APP).service" & \
+	ssh isu02 "sudo systemctl start $(APP).service" & \
+	ssh isu03 "sudo systemctl start $(APP).service" & \
 	wait
 
 ### nginx
@@ -76,9 +82,9 @@ restart-db:
 	ssh isu03 "sudo systemctl restart mysql.service" & \
 	wait
 
-pt-query-digest:
+pt-query-digest: always
 	ssh isu01 'sudo cat /var/log/mysql/mysql-slow.log | pt-query-digest'
 
-alp:
+alp: always
 	ssh isu01 "sudo alp ltsv --sort sum --reverse --file /var/log/nginx/access_log.ltsv -m '^/api/player/competition/[^/]+/ranking$$,^/api/organizer/player/[^/]+/disqualified$$',^/api/player/player/[^/]+$$,^/api/organizer/competition/[^/]+/score$$,^/api/organizer/competition/[^/]+/finish$$"
 
