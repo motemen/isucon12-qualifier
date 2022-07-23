@@ -27,6 +27,8 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+
+	"github.com/gomodule/redigo/redis"
 )
 
 const (
@@ -131,11 +133,25 @@ func SetCacheControlPrivate(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+var redisPool *redis.Pool
+
+const redisKeyPrefixVisitHistory = "visitHistory:" // + competitionID
+
+func redisKeyVisitHistory(competitionID string) string {
+	return redisKeyPrefixVisitHistory + competitionID
+}
+
 // Run は cmd/isuports/main.go から呼ばれるエントリーポイントです
 func Run() {
 	e := echo.New()
 	e.Debug = true
 	e.Logger.SetLevel(log.DEBUG)
+
+	redisPool = &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			return redis.DialURL("isuports-2.t.isucon.dev")
+		},
+	}
 
 	var (
 		sqlLogger io.Closer
@@ -545,23 +561,24 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 	}
 
 	// ランキングにアクセスした参加者のIDを取得する
-	vhs := []VisitHistorySummaryRow{}
-	if err := adminDB.SelectContext(
-		ctx,
-		&vhs,
-		"SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? AND competition_id = ? GROUP BY player_id",
-		tenantID,
-		comp.ID,
-	); err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("error Select visit_history: tenantID=%d, competitionID=%s, %w", tenantID, comp.ID, err)
-	}
 	billingMap := map[string]string{}
-	for _, vh := range vhs {
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	// PlayedID - FirstVisitedAt で入ってるよ
+	kvs, err := redis.String(redisConn.Do("HGETALL", redisKeyVisitHistory(comp.ID)))
+	if err != nil {
+		return nil, fmt.Errorf("redis HGETALL %v", redisKeyVisitHistory(comp.ID))
+	}
+	for i := 0; i < len(kvs); i += 2 {
+		playerID, _ := redis.String(kvs[i], nil)
+		firstVisitedAt, _ := redis.Int64(kvs[i], nil)
 		// competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
-		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < vh.MinCreatedAt {
+		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < firstVisitedAt {
 			continue
 		}
-		billingMap[vh.PlayerID] = "visitor"
+		billingMap[playerID] = "visitor"
 	}
 
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
@@ -1116,7 +1133,6 @@ func competitionScoreHandler(c echo.Context) error {
 				"error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
 				ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
 			)
-
 		}
 	}
 
@@ -1340,14 +1356,14 @@ func competitionRankingHandler(c echo.Context) error {
 		return fmt.Errorf("error Select tenant: id=%d, %w", v.tenantID, err)
 	}
 
-	if _, err := adminDB.ExecContext(
-		ctx,
-		"INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-		v.playerID, tenant.ID, competitionID, now, now,
-	); err != nil {
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	_, err = redisConn.Do("HSETNX", redisKeyVisitHistory(competitionID), v.playerID, now)
+	if err != nil {
 		return fmt.Errorf(
-			"error Insert visit_history: playerID=%s, tenantID=%d, competitionID=%s, createdAt=%d, updatedAt=%d, %w",
-			v.playerID, tenant.ID, competitionID, now, now, err,
+			"failed: HSETNX %v %v %v",
+			redisKeyVisitHistory(competitionID), v.playerID, now,
 		)
 	}
 
