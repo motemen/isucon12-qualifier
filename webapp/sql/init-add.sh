@@ -17,12 +17,12 @@ mysql -u"$ISUCON_DB_USER" \
 		"$ISUCON_DB_NAME" < tenant/10_schema.mysql.sql
 
 # 追加初期データ
-for sql in $(ls ../../initial_data/initial_data_mysql/work/bulk | grep '.sql'); do
+for sql in $(ls ../../initial_data_mysql/work/bulk | grep '.sql'); do
     echo $sql
 	mysql -u"$ISUCON_DB_USER" \
 			-p"$ISUCON_DB_PASSWORD" \
 			--host "$ISUCON_DB_HOST" \
 			--port "$ISUCON_DB_PORT" \
-			"$ISUCON_DB_NAME" < ../../initial_data/initial_data_mysql/work/bulk/$sql
+			"$ISUCON_DB_NAME" < ../../initial_data_mysql/work/bulk/$sql
 done
 
