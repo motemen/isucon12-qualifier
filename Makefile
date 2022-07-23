@@ -66,13 +66,19 @@ reset-logs:
 deploy-db: scp-db restart-db
 
 scp-db:
-	# ssh isu01 "sudo dd of=/etc/mysql/mysql.conf.d/mysqld.cnf" < ./etc/mysql/mysql.conf.d/mysqld.cnf
-	# ssh isu02 "sudo dd of=/etc/mysql/mysql.conf.d/mysqld.cnf" < ./etc/mysql/mysql.conf.d/mysqld.cnf
+	ssh isu01 "sudo dd of=/etc/mysql/mysql.conf.d/mysqld.cnf" < ./etc/mysql/mysql.conf.d/mysqld.cnf
+	ssh isu02 "sudo dd of=/etc/mysql/mysql.conf.d/mysqld.cnf" < ./etc/mysql/mysql.conf.d/mysqld.cnf
 	ssh isu03 "sudo dd of=/etc/mysql/mysql.conf.d/mysqld.cnf" < ./etc/mysql/mysql.conf.d/mysqld.cnf
 
 restart-db:
-	# ssh isu01 "sudo systemctl restart mysql.service" & \
-	# ssh isu02 "sudo systemctl restart mysql.service"
+	ssh isu01 "sudo systemctl restart mysql.service" & \
+	ssh isu02 "sudo systemctl restart mysql.service" & \
 	ssh isu03 "sudo systemctl restart mysql.service" & \
 	wait
+
+pt-query-digest:
+	ssh isu01 'sudo cat /var/log/mysql/mysql-slow.log | pt-query-digest'
+
+alp:
+	ssh isu01 "sudo alp ltsv --sort sum --reverse --file /var/log/nginx/access_log.ltsv -m '^/api/player/competition/[^/]+/ranking$$,^/api/organizer/player/[^/]+/disqualified$$',^/api/player/player/[^/]+$$,^/api/organizer/competition/[^/]+/score$$,^/api/organizer/competition/[^/]+/finish$$"
 
