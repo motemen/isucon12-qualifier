@@ -143,6 +143,11 @@ func redisKeyVisitHistory(competitionID string) string {
 	return redisKeyPrefixVisitHistory + competitionID
 }
 
+func redisKeyPlayerScore(competitionID, playerID string) string {
+	const redisKeyPrefixVisitHistory = "playerScore:" // + competitionID + ":" + playerID
+	return redisKeyPrefixVisitHistory + competitionID + ":" + playerID
+}
+
 //go:embed initial_visit_history.json
 var initialVisitHistoryJSON []byte
 
@@ -1169,7 +1174,11 @@ func competitionScoreHandler(c echo.Context) error {
 	); err != nil {
 		return fmt.Errorf("error Delete player_score: tenantID=%d, competitionID=%s, %w", v.tenantID, competitionID, err)
 	}
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
 	for _, ps := range playerScoreRows {
+		// FIXME: SQLite 脱却できたらここの SQLite 書き込みは不要
 		if _, err := tenantDB.NamedExecContext(
 			ctx,
 			"INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (:id, :tenant_id, :player_id, :competition_id, :score, :row_num, :created_at, :updated_at)",
@@ -1179,6 +1188,9 @@ func competitionScoreHandler(c echo.Context) error {
 				"error Insert player_score: id=%s, tenant_id=%d, playerID=%s, competitionID=%s, score=%d, rowNum=%d, createdAt=%d, updatedAt=%d, %w",
 				ps.ID, ps.TenantID, ps.PlayerID, ps.CompetitionID, ps.Score, ps.RowNum, ps.CreatedAt, ps.UpdatedAt, err,
 			)
+		}
+		if _, err := redisConn.Do("SET", redisKeyPlayerScore(ps.CompetitionID, ps.PlayerID), ps.Score); err != nil {
+			return err
 		}
 	}
 
@@ -1293,31 +1305,57 @@ func playerHandler(c echo.Context) error {
 		return fmt.Errorf("error Select competition: %w", err)
 	}
 
-	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-	fl, err := flockByTenantID(v.tenantID)
-	if err != nil {
-		return fmt.Errorf("error flockByTenantID: %w", err)
-	}
-	defer fl.Close()
 	pss := make([]PlayerScoreRow, 0, len(cs))
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+	// redis にない Competitions は SQLite から取れるようにリストに入れておく
+	cs_missing_in_redis := []CompetitionRow{}
 	for _, c := range cs {
-		ps := PlayerScoreRow{}
-		if err := tenantDB.GetContext(
-			ctx,
-			&ps,
-			// 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
-			"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1",
-			v.tenantID,
-			c.ID,
-			p.ID,
-		); err != nil {
-			// 行がない = スコアが記録されてない
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
+		score, err := redis.Int64(redisConn.Do("GET", redisKeyPlayerScore(c.ID, playerID)))
+		if err != nil {
+			if err == redis.ErrNil {
+				cs_missing_in_redis = append(cs_missing_in_redis, c)
+			} else {
+				return fmt.Errorf("redis GET %v, %e", redisKeyPlayerScore(c.ID, playerID), err)
 			}
-			return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, playerID=%s, %w", v.tenantID, c.ID, p.ID, err)
+		}
+		ps := PlayerScoreRow{
+			TenantID:      v.tenantID,
+			PlayerID:      playerID,
+			CompetitionID: c.ID,
+			Score:         score,
 		}
 		pss = append(pss, ps)
+	}
+
+	// redis にない場合は SQLite から取る
+	if len(cs_missing_in_redis) > 0 {
+		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+		fl, err := flockByTenantID(v.tenantID)
+		if err != nil {
+			return fmt.Errorf("error flockByTenantID: %w", err)
+		}
+		defer fl.Close()
+
+		for _, c := range cs_missing_in_redis {
+			ps := PlayerScoreRow{}
+			if err := tenantDB.GetContext(
+				ctx,
+				&ps,
+				// 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
+				"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1",
+				v.tenantID,
+				c.ID,
+				p.ID,
+			); err != nil {
+				// 行がない = スコアが記録されてない
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, playerID=%s, %w", v.tenantID, c.ID, p.ID, err)
+			}
+			pss = append(pss, ps)
+		}
 	}
 
 	psds := make([]PlayerScoreDetail, 0, len(pss))
