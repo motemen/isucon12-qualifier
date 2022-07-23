@@ -10,7 +10,7 @@ $(APP): webapp/go/*.go always
 	cd webapp/go && go get && GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o ../../$(APP)
 
 # deploy: $(APP) stop reset-logs scp scp-sql scp-env start
-deploy: stop reset-logs scp scp-docker-compose start
+deploy: stop reset-logs scp scp-sql scp-docker-compose start
 
 # scp: $(APP)
 # 	scp ./$(APP) isu01:/home/isucon/webapp/go/$(APP) & \
