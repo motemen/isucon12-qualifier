@@ -94,3 +94,7 @@ pt-query-digest: always
 alp: always
 	ssh isu01 "sudo alp ltsv --sort sum --reverse --file /var/log/nginx/access_log.ltsv -m '^/api/player/competition/[^/]+/ranking$$,^/api/organizer/player/[^/]+/disqualified$$',^/api/player/player/[^/]+$$,^/api/organizer/competition/[^/]+/score$$,^/api/organizer/competition/[^/]+/finish$$"
 
+rsync-dumpsql:
+	rsync -avz initial_data/initial_data_mysql/ isu01:initial_data_mysql/
+	rsync -avz initial_data/initial_data_mysql/ isu02:initial_data_mysql/
+	rsync -avz initial_data/initial_data_mysql/ isu02:initial_data_mysql/
