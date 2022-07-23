@@ -135,10 +135,43 @@ func SetCacheControlPrivate(next echo.HandlerFunc) echo.HandlerFunc {
 
 var redisPool *redis.Pool
 
-const redisKeyPrefixVisitHistory = "visitHistory:" // + competitionID
-
 func redisKeyVisitHistory(competitionID string) string {
+	const redisKeyPrefixVisitHistory = "visitHistory:" // + competitionID
 	return redisKeyPrefixVisitHistory + competitionID
+}
+
+func initializeRedis(ctx context.Context) error {
+	type vhRow struct {
+		PlayerID      string `db:"player_id"`
+		MinCreatedAt  int64  `db:"min_created_at"`
+		CompetitionID string `db:"competition_id"`
+	}
+
+	vhs := []vhRow{}
+	if err := adminDB.SelectContext(
+		ctx,
+		&vhs,
+		"SELECT player_id, MIN(created_at) AS min_created_at, competition_id FROM visit_history GROUP BY player_id",
+	); err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("error Select visit_history")
+	}
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	_, err := redisConn.Do("FLUSHALL")
+	if err != nil {
+		return err
+	}
+
+	for _, vh := range vhs {
+		_, err := redisConn.Do("HSET", redisKeyVisitHistory(vh.CompetitionID), vh.PlayerID, vh.MinCreatedAt)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Run は cmd/isuports/main.go から呼ばれるエントリーポイントです
@@ -1632,5 +1665,10 @@ func initializeHandler(c echo.Context) error {
 	res := InitializeHandlerResult{
 		Lang: "go",
 	}
+	err = initializeRedis(context.Background())
+	if err != nil {
+		return fmt.Errorf("initializeRedis: %e", err)
+	}
+
 	return c.JSON(http.StatusOK, SuccessResult{Status: true, Data: res})
 }
