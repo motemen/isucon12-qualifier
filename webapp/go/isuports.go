@@ -745,10 +745,10 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 }
 
 // 計算済みの課金レポートを取得する
-func getBillingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID int64, competitonIDs []string) (*[]BillingReport, error) {
+func getBillingReportByCompetition(ctx context.Context, tenantID int64, competitonIDs []string) (*[]BillingReport, error) {
 
 	br := []BillingReport{}
-	if err := tenantDB.SelectContext(
+	if err := adminDB.SelectContext(
 		ctx,
 		&br,
 		"SELECT * FROM billing WHERE tenant_id=? AND competitionID IN (?)",
@@ -853,7 +853,7 @@ func tenantsBillingHandler(c echo.Context) error {
 			for _, comp := range cs {
 				compIDs = append(compIDs, comp.ID)
 			}
-			reports, err := getBillingReportByCompetition(ctx, tenantDB, t.ID, compIDs)
+			reports, err := getBillingReportByCompetition(ctx, t.ID, compIDs)
 			if err != nil {
 				return fmt.Errorf("failed to getBillingReportByCompetition: %w", err)
 			}
