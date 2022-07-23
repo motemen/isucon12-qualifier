@@ -1516,6 +1516,13 @@ func competitionRankingHandler(c echo.Context) error {
 
 	ranks := []CompetitionRank{}
 
+	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+	fl, err := flockByTenantID(v.tenantID)
+	if err != nil {
+		return fmt.Errorf("error flockByTenantID: %w", err)
+	}
+	defer fl.Close()
+
 	b, err := redis.Bytes(redisConn.Do("GET", "rankRows:"+competitionID))
 	if err == nil {
 		var rankRows []rankRowType
@@ -1540,12 +1547,6 @@ func competitionRankingHandler(c echo.Context) error {
 	} else if err != redis.ErrNil {
 		return fmt.Errorf("error redis GET rankRows:%s, %w", competitionID, err)
 	} else {
-		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
-		fl, err := flockByTenantID(v.tenantID)
-		if err != nil {
-			return fmt.Errorf("error flockByTenantID: %w", err)
-		}
-		defer fl.Close()
 		pss := []PlayerScoreRow{}
 		if err := tenantDB.SelectContext(
 			ctx,
