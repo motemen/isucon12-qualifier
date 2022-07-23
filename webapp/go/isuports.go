@@ -632,7 +632,6 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 		billingMap[playerID] = "visitor"
 	}
 
-	ranks := []CompetitionRank{}
 	b, err := redis.Bytes(redisConn.Do("GET", "rankRows:"+comp.ID))
 	if err == nil {
 		var rankRows []rankRowType
@@ -641,11 +640,10 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 			return nil, fmt.Errorf("error json.Unmarshal: %w", err)
 		}
 
-		ranks = make([]CompetitionRank, len(rankRows))
-		for i := range ranks {
-			billingMap[ranks[i].PlayerID] = "player"
+		for i := range rankRows {
+			billingMap[rankRows[i].PlayerID] = "player"
 		}
-	} else if err != redis.ErrNil {
+	} else if err == redis.ErrNil {
 		// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
 		fl, err := flockByTenantID(tenantID)
 		if err != nil {
@@ -667,6 +665,8 @@ func billingReportByCompetition(ctx context.Context, tenantDB dbOrTx, tenantID i
 			// スコアが登録されている参加者
 			billingMap[pid] = "player"
 		}
+	} else {
+		return nil, fmt.Errorf("error redis GET %v, %e", "rankRows:"+comp.ID, err)
 	}
 
 	// 大会が終了している場合のみ請求金額が確定するので計算する
