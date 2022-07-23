@@ -16,6 +16,23 @@ mysql -u"$ISUCON_DB_USER" \
 		--port "$ISUCON_DB_PORT" \
 		"$ISUCON_DB_NAME" < init.sql
 
+
+# 追加テーブル
+mysql -u"$ISUCON_DB_USER" \
+		-p"$ISUCON_DB_PASSWORD" \
+		--host "$ISUCON_DB_HOST" \
+		--port "$ISUCON_DB_PORT" \
+		"$ISUCON_DB_NAME" < tenant/10_schema.mysql.sql
+
+# 追加初期データ
+for sql in $(ls ../../initial_data_mysql | grep '.sql'); do
+	mysql -u"$ISUCON_DB_USER" \
+			-p"$ISUCON_DB_PASSWORD" \
+			--host "$ISUCON_DB_HOST" \
+			--port "$ISUCON_DB_PORT" \
+			"$ISUCON_DB_NAME" < ../../initial_data_mysql/$sql
+done
+
 # SQLiteのデータベースを初期化
 rm -f ../tenant_db/*.db
 cp -r ../../initial_data/*.db ../tenant_db/
