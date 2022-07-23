@@ -1525,14 +1525,14 @@ func competitionRankingHandler(c echo.Context) error {
 		}
 
 		ranks = make([]CompetitionRank, len(rankRows))
-		for i := range ranks {
-			player, err := retrievePlayer(ctx, tenantDB, ranks[i].PlayerID)
+		for i := range rankRows {
+			player, err := retrievePlayer(ctx, tenantDB, rankRows[i].PlayerID)
 			if err != nil {
 				return fmt.Errorf("error retrievePlayer: %w", err)
 			}
 			ranks[i] = CompetitionRank{
 				Rank:              int64(i),
-				Score:             ranks[i].Score,
+				Score:             rankRows[i].Score,
 				PlayerDisplayName: player.DisplayName,
 				PlayerID:          player.ID,
 			}
