@@ -62,8 +62,13 @@ func getEnv(key string, defaultValue string) string {
 	return defaultValue
 }
 
+var db *sqlx.DB
+
 // 管理用DBに接続する
 func connectAdminDB() (*sqlx.DB, error) {
+	if db != nil {
+		return db, nil
+	}
 	config := mysql.NewConfig()
 	config.Net = "tcp"
 	config.Addr = getEnv("ISUCON_DB_HOST", "127.0.0.1") + ":" + getEnv("ISUCON_DB_PORT", "3306")
@@ -72,7 +77,9 @@ func connectAdminDB() (*sqlx.DB, error) {
 	config.DBName = getEnv("ISUCON_DB_NAME", "isuports")
 	config.ParseTime = true
 	dsn := config.FormatDSN()
-	return sqlx.Open("mysql", dsn)
+	var err error
+	db, err = sqlx.Open("mysql", dsn)
+	return db, err
 }
 
 // テナントDBのパスを返す
@@ -83,12 +90,7 @@ func tenantDBPath(id int64) string {
 
 // テナントDBに接続する
 func connectToTenantDB(id int64) (*sqlx.DB, error) {
-	p := tenantDBPath(id)
-	db, err := sqlx.Open(sqliteDriverName, fmt.Sprintf("file:%s?mode=rw", p))
-	if err != nil {
-		return nil, fmt.Errorf("failed to open tenant DB: %w", err)
-	}
-	return db, nil
+	return connectAdminDB()
 }
 
 // システム全体で一意なIDを生成する
