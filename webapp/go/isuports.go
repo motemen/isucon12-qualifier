@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/gomodule/redigo/redis"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -29,8 +30,6 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
-
-	"github.com/gomodule/redigo/redis"
 )
 
 const (
@@ -49,8 +48,6 @@ var (
 	tenantNameRegexp = regexp.MustCompile(`^[a-z][a-z0-9-]{0,61}[a-z0-9]$`)
 
 	adminDB *sqlx.DB
-
-	sqliteDriverName = "sqlite3"
 )
 
 // 環境変数を取得する、なければデフォルト値を返す
@@ -61,8 +58,13 @@ func getEnv(key string, defaultValue string) string {
 	return defaultValue
 }
 
+var db *sqlx.DB
+
 // 管理用DBに接続する
 func connectAdminDB() (*sqlx.DB, error) {
+	if db != nil {
+		return db, nil
+	}
 	config := mysql.NewConfig()
 	config.Net = "tcp"
 	config.Addr = getEnv("ISUCON_DB_HOST", "127.0.0.1") + ":" + getEnv("ISUCON_DB_PORT", "3306")
@@ -72,7 +74,9 @@ func connectAdminDB() (*sqlx.DB, error) {
 	config.ParseTime = true
 
 	dsn := config.FormatDSN()
-	return sqlx.Open("mysql", dsn)
+	var err error
+	db, err = sqlx.Open("mysql", dsn)
+	return db, err
 }
 
 // テナントDBのパスを返す
@@ -83,23 +87,7 @@ func tenantDBPath(id int64) string {
 
 // テナントDBに接続する
 func connectToTenantDB(id int64) (*sqlx.DB, error) {
-	p := tenantDBPath(id)
-	db, err := sqlx.Open(sqliteDriverName, fmt.Sprintf("file:%s?mode=rw", p))
-	if err != nil {
-		return nil, fmt.Errorf("failed to open tenant DB: %w", err)
-	}
-	return db, nil
-}
-
-// テナントDBを新規に作成する
-func createTenantDB(id int64) error {
-	p := tenantDBPath(id)
-
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("sqlite3 %s < %s", p, tenantDBSchemaFilePath))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to exec sqlite3 %s < %s, out=%s: %w", p, tenantDBSchemaFilePath, string(out), err)
-	}
-	return nil
+	return connectAdminDB()
 }
 
 // システム全体で一意なIDを生成する
@@ -199,19 +187,7 @@ func Run() {
 		},
 	}
 
-	var (
-		sqlLogger io.Closer
-		err       error
-	)
-	// sqliteのクエリログを出力する設定
-	// 環境変数 ISUCON_SQLITE_TRACE_FILE を設定すると、そのファイルにクエリログをJSON形式で出力する
-	// 未設定なら出力しない
-	// sqltrace.go を参照
-	sqliteDriverName, sqlLogger, err = initializeSQLLogger()
-	if err != nil {
-		e.Logger.Panicf("error initializeSQLLogger: %s", err)
-	}
-	defer sqlLogger.Close()
+	var err error
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
@@ -539,12 +515,6 @@ func tenantsAddHandler(c echo.Context) error {
 	if err != nil {
 		return fmt.Errorf("error get LastInsertId: %w", err)
 	}
-	// NOTE: 先にadminDBに書き込まれることでこのAPIの処理中に
-	//       /api/admin/tenants/billingにアクセスされるとエラーになりそう
-	//       ロックなどで対処したほうが良さそう
-	if err := createTenantDB(id); err != nil {
-		return fmt.Errorf("error createTenantDB: id=%d name=%s %w", id, name, err)
-	}
 
 	res := TenantsAddHandlerResult{
 		Tenant: TenantWithBilling{
@@ -721,7 +691,6 @@ func tenantsBillingHandler(c echo.Context) error {
 			if err != nil {
 				return fmt.Errorf("failed to connectToTenantDB: %w", err)
 			}
-			defer tenantDB.Close()
 			cs := []CompetitionRow{}
 			if err := tenantDB.SelectContext(
 				ctx,
@@ -782,7 +751,6 @@ func playersListHandler(c echo.Context) error {
 	if err != nil {
 		return fmt.Errorf("error connectToTenantDB: %w", err)
 	}
-	defer tenantDB.Close()
 
 	var pls []PlayerRow
 	if err := tenantDB.SelectContext(
@@ -828,7 +796,6 @@ func playersAddHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	params, err := c.FormParams()
 	if err != nil {
@@ -891,7 +858,6 @@ func playerDisqualifiedHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	playerID := c.Param("player_id")
 
@@ -951,7 +917,6 @@ func competitionsAddHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	title := c.FormValue("title")
 
@@ -997,7 +962,6 @@ func competitionFinishHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	id := c.Param("competition_id")
 	if id == "" {
@@ -1047,7 +1011,6 @@ func competitionScoreHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	competitionID := c.Param("competition_id")
 	if competitionID == "" {
@@ -1186,7 +1149,6 @@ func billingHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	cs := []CompetitionRow{}
 	if err := tenantDB.SelectContext(
@@ -1243,7 +1205,6 @@ func playerHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	if err := authorizePlayer(ctx, tenantDB, v.playerID); err != nil {
 		return err
@@ -1348,7 +1309,6 @@ func competitionRankingHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	if err := authorizePlayer(ctx, tenantDB, v.playerID); err != nil {
 		return err
@@ -1505,7 +1465,6 @@ func playerCompetitionsHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	if err := authorizePlayer(ctx, tenantDB, v.playerID); err != nil {
 		return err
@@ -1529,7 +1488,6 @@ func organizerCompetitionsHandler(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tenantDB.Close()
 
 	return competitionsHandler(c, v, tenantDB)
 }

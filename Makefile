@@ -73,7 +73,7 @@ reload-nginx:
 
 reset-logs:
 	ssh isu01 'sudo truncate -s 0 /var/log/nginx/access_log.ltsv'
-	ssh isu01 'sudo truncate -s 0 /var/log/mysql/mysql-slow.log'
+	ssh isu03 'sudo truncate -s 0 /var/log/mysql/mysql-slow.log'
 
 deploy-db: scp-db restart-db
 
@@ -101,7 +101,7 @@ restart-redis:
 ## 計測
 
 pt-query-digest: always
-	ssh isu01 'sudo cat /var/log/mysql/mysql-slow.log | pt-query-digest'
+	ssh isu03 'sudo cat /var/log/mysql/mysql-slow.log | pt-query-digest'
 
 alp: always
 	ssh isu01 "sudo alp ltsv --sort sum --reverse --file /var/log/nginx/access_log.ltsv -m '^/api/player/competition/[^/]+/ranking$$,^/api/organizer/player/[^/]+/disqualified$$',^/api/player/player/[^/]+$$,^/api/organizer/competition/[^/]+/score$$,^/api/organizer/competition/[^/]+/finish$$"
