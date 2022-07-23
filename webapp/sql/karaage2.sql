@@ -1,8 +1,8 @@
 DROP TABLE IF EXISTS competition;
 DROP TABLE IF EXISTS player;
-DROP TABLE IF EXISTS player_score;
+-- DROP TABLE IF EXISTS player_score;
 
-CREATE TABLE competition (
+CREATE TABLE competition IF NOT EXISTS (
   id VARCHAR(10) CHARACTER SET ascii NOT NULL PRIMARY KEY,
   tenant_id BIGINT NOT NULL,
   title TEXT NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE competition (
   INDEX `tenant_idx` (`tenant_id`)
 );
 
-CREATE TABLE player (
+CREATE TABLE player IF NOT EXISTS (
   id VARCHAR(10) CHARACTER SET ascii NOT NULL PRIMARY KEY,
   tenant_id BIGINT NOT NULL,
   display_name TEXT NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE player (
   INDEX `tenant_idx` (`tenant_id`)
 );
 
-CREATE TABLE player_score (
+CREATE TABLE player_score IF NOT EXISTS (
   id VARCHAR(10) CHARACTER SET ascii NOT NULL PRIMARY KEY,
   tenant_id BIGINT NOT NULL,
   player_id VARCHAR(10) CHARACTER SET ascii NOT NULL,
