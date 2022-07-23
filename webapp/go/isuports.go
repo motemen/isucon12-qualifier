@@ -610,23 +610,24 @@ func calculateBillingData(ctx context.Context, tenantDB dbOrTx, tenantID int64, 
 	}
 
 	// ランキングにアクセスした参加者のIDを取得する
-	vhs := []VisitHistorySummaryRow{}
-	if err := adminDB.SelectContext(
-		ctx,
-		&vhs,
-		"SELECT player_id, MIN(created_at) AS min_created_at FROM visit_history WHERE tenant_id = ? AND competition_id = ? GROUP BY player_id",
-		tenantID,
-		comp.ID,
-	); err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("error Select visit_history: tenantID=%d, competitionID=%s, %w", tenantID, comp.ID, err)
-	}
 	billingMap := map[string]string{}
-	for _, vh := range vhs {
+
+	redisConn := redisPool.Get()
+	defer redisConn.Close()
+
+	// PlayedID - FirstVisitedAt で入ってるよ
+	kvs, err := redis.Strings(redisConn.Do("HGETALL", redisKeyVisitHistory(comp.ID)))
+	if err != nil {
+		return nil, fmt.Errorf("redis HGETALL %v, %e", redisKeyVisitHistory(comp.ID), err)
+	}
+	for i := 0; i < len(kvs); i += 2 {
+		playerID, _ := redis.String(kvs[i], nil)
+		firstVisitedAt, _ := redis.Int64(kvs[i], nil)
 		// competition.finished_atよりもあとの場合は、終了後に訪問したとみなして大会開催内アクセス済みとみなさない
-		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < vh.MinCreatedAt {
+		if comp.FinishedAt.Valid && comp.FinishedAt.Int64 < firstVisitedAt {
 			continue
 		}
-		billingMap[vh.PlayerID] = "visitor"
+		billingMap[playerID] = "visitor"
 	}
 
 	// player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
